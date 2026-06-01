@@ -102,6 +102,10 @@ class HciWsClient extends EventTarget {
     return this.send({ type: 'chat.start', message, profile, session_id, model });
   }
 
+  chatSend({ message, session_id }) {
+    return this.send({ type: 'chat.send', message, session_id });
+  }
+
   chatStop() {
     return this.send({ type: 'chat.stop' });
   }

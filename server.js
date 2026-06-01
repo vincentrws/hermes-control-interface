@@ -2789,7 +2789,7 @@ app.get('/api/file', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/file', requireCsrf, (req, res) => {
+app.post('/api/file', requireAuth, requireCsrf, requirePerm('files.write'), (req, res) => {
   const { path: filePath, content } = req.body || {};
   if (!filePath) return res.status(400).json({ error: 'path required' });
   try {
@@ -5057,6 +5057,7 @@ async function broadcast() {
 
 wss.on('connection', async (socket, req) => {
   socket.authed = isAuthed(req);
+  socket.user = getCurrentUser(req); // store for permission checks
   socket.clientId = 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36);
   socket.activeChatReader = null; // for cancelling gateway streams
   if (!socket.authed) {
@@ -5080,7 +5081,7 @@ wss.on('connection', async (socket, req) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'ping') socket.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
-      if (msg.type === 'terminal-input' && socket.authed) {
+      if (msg.type === 'terminal-input' && socket.authed && (socket.user?.role === 'admin' || socket.user?.permissions?.terminal)) {
         let data = String(msg.data || '');
         if (data.length > 4096) return;
         data = data.replace(/\x1b\[[0-9;]*R/g, '').replace(/;[0-9]+R/g, '');
@@ -5098,7 +5099,7 @@ wss.on('connection', async (socket, req) => {
         const session = ensureTerminalSession();
         if (session.proc) session.proc.write(data);
       }
-      if (msg.type === 'terminal-resize' && socket.authed) {
+      if (msg.type === 'terminal-resize' && socket.authed && (socket.user?.role === 'admin' || socket.user?.permissions?.terminal)) {
         const cols = Number(msg.cols || 120);
         const rows = Number(msg.rows || 32);
         terminalSession.cols = cols;
@@ -5146,6 +5147,13 @@ wss.on('connection', async (socket, req) => {
       }
       if (msg.type === 'chat.stop' && socket.authed && socket.tuiBridge) {
         socket.tuiBridge.chatStop(socket.tuiSessionId);
+      }
+      if (msg.type === 'chat.send' && socket.authed && socket.tuiBridge) {
+        try {
+          await socket.tuiBridge.chatSend({ message: msg.message, session_id: socket.tuiSessionId });
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
       }
       if (msg.type === 'clarify.respond' && socket.authed && socket.tuiBridge) {
         try {

@@ -1867,8 +1867,13 @@ async function sendViaWebSocket(text, profile, sessionId) {
     }
     wsClient.addEventListener('message', onDone);
 
-    // Send via WS
-    const ok = wsClient.chatStart({ message: text, profile, session_id: sessionId });
+    // Send via WS — use chatStart for first message, chatSend for subsequent
+    let ok;
+    if (sessionId) {
+      ok = wsClient.chatSend({ message: text, session_id: sessionId });
+    } else {
+      ok = wsClient.chatStart({ message: text, profile, session_id: sessionId });
+    }
     if (!ok) {
       wsClient.removeEventListener('message', onDone);
       reject(new Error('WebSocket not connected'));
