@@ -100,6 +100,7 @@ function shell(cmd, timeout = '8s') {
       encoding: 'utf8',
       maxBuffer: 64 * 1024,
       timeout: parseShellTimeout(timeout),
+      env: { ...process.env, HERMES_HOME: CONTROL_HOME },
     }, (err, stdout, stderr) => {
       resolve((stdout || stderr || '').trim());
     });
@@ -114,6 +115,7 @@ function execHermes(args, timeout = 30000, stdin = null) {
       encoding: 'utf8',
       maxBuffer: 64 * 1024,
       timeout,
+      env: { ...process.env, HERMES_HOME: CONTROL_HOME },
     }, (err, stdout, stderr) => {
       // stderr often contains real error messages hermes doesn't write to stdout
       const output = err ? (stdout + '\n' + stderr) : stdout;
@@ -252,7 +254,7 @@ app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, 'node_mod
 // ── Plugin System ──
 // Scan ~/.hermes/skills/*/ui/manifest.json for plugin registrations
 function findPluginManifests() {
-  const skillsDir = path.join(os.homedir(), '.hermes', 'skills');
+  const skillsDir = path.join(CONTROL_HOME, 'skills');
   const manifests = [];
   if (!fs.existsSync(skillsDir)) return manifests;
   try {
@@ -314,13 +316,13 @@ const events = [];
 // ── Gateway API Proxy (fast, structured events) ────────────────────
 // Gateway API key: explicit config → auto-discover from hermes config.yaml
 const GATEWAY_API_KEY = cfg.gatewayApiKey || loadGatewayApiKey();
-const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
+const HERMES_HOME = CONTROL_HOME;
 
 // Load gateway API key from default profile config.yaml
 function loadGatewayApiKey() {
   try {
     const yaml = require('js-yaml');
-    const configPath = path.join(os.homedir(), '.hermes', 'config.yaml');
+    const configPath = path.join(CONTROL_HOME, 'config.yaml');
     if (fs.existsSync(configPath)) {
       const cfg = yaml.load(fs.readFileSync(configPath, 'utf8'));
       return cfg?.platforms?.api_server?.extra?.key || '';
@@ -347,7 +349,7 @@ function resolveCorsOrigins(req) {
 // Scans ~/.hermes/config.yaml (default) + ~/.hermes/profiles/*/config.yaml
 function discoverGatewayPorts() {
   const ports = {};
-  const baseHermesHome = path.join(os.homedir(), '.hermes');
+  const baseHermesHome = CONTROL_HOME;
   try {
     // Default profile: ~/.hermes/config.yaml (base, not HERMES_HOME which may be profile-specific)
     const defaultConf = fs.readFileSync(path.join(baseHermesHome, 'config.yaml'), 'utf8');
@@ -374,6 +376,9 @@ function discoverGatewayPorts() {
       } catch (_) { /* skip broken config */ }
     }
   } catch (_) { /* no profiles dir */ }
+  if (!ports['default']) {
+    ports['default'] = 9119;
+  }
   return ports;
 }
 
@@ -424,7 +429,7 @@ async function probeGatewayHealth(profile) {
 
 // Read default model from profile config.yaml
 function getDefaultModel(profile) {
-  const baseHermesHome = path.join(os.homedir(), '.hermes');
+  const baseHermesHome = CONTROL_HOME;
   try {
     const configPath = profile === 'default'
       ? path.join(baseHermesHome, 'config.yaml')
@@ -575,7 +580,7 @@ app.post('/api/chat/send', requireAuth, requirePerm('chat.use'), chatLimiter, as
   try {
     const proc = spawn('bash', ['-lc', fullCmd], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes') },
+      env: { ...process.env, HERMES_HOME: CONTROL_HOME },
     });
 
     proc.stdout.on('data', (chunk) => {
@@ -772,7 +777,7 @@ app.post('/api/chat/fork', requireAuth, requireCsrf, requirePerm('chat.use'), (r
 // ── Model Info — read from config.yaml ──
 app.get('/api/models', requireAuth, async (req, res) => {
   try {
-    const configPath = path.join(os.homedir(), '.hermes', 'config.yaml');
+    const configPath = path.join(CONTROL_HOME, 'config.yaml');
     const configContent = await fs.promises.readFile(configPath, 'utf-8');
     const config = yaml.load(configContent) || {};
     
@@ -1178,7 +1183,7 @@ function safeStat(filePath) {
 
 function readFileSafe(filePath, maxBytes = 120_000) {
   // Use actual Hermes home (env var takes precedence, then config, then ~/.hermes)
-  const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
+  const HERMES = CONTROL_HOME;
   const rel = String(filePath || '').replace(/^\/+/, '');
   const abs = path.resolve(HERMES, rel);
   if (!isAllowedPath(abs)) throw new Error('path outside allowed roots');
@@ -1190,7 +1195,7 @@ function readFileSafe(filePath, maxBytes = 120_000) {
 }
 
 function writeFileSafe(filePath, content) {
-  const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
+  const HERMES = CONTROL_HOME;
   const rel = String(filePath || '').replace(/^\/+/, '');
   const abs = path.resolve(HERMES, rel);
   if (!isAllowedPath(abs)) throw new Error('path outside allowed roots');
@@ -1442,9 +1447,9 @@ function getStateDbPath(profile) {
   // Named profiles (soci, david, cuan…) live under profiles/{name}/state.db
   // The default/unnamed profile uses Hermes root-level state.db
   if (profile && profile !== 'default') {
-    return path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db');
+    return path.join(CONTROL_HOME, 'profiles', profile, 'state.db');
   }
-  return path.join(os.homedir(), '.hermes', 'state.db');
+  return path.join(CONTROL_HOME, 'state.db');
 }
 
 function loadSessionsFromDb(stateDbPath, limit = 250) {
@@ -2238,15 +2243,21 @@ app.get('/api/agent/status', requireAuth, async (req, res) => {
     // Parse key fields
     const model = grab('Model');
     const provider = grab('Provider');
-    // Gateway status — probe API first, systemctl fallback
+    // Gateway status — probe API first, cli status fallback
     let gatewayStatus = 'unknown';
     let gatewayManagedBy = 'unknown';
     try {
       const probe = await probeGatewayHealth('default');
-      gatewayStatus = probe.ok ? 'running' : 'stopped';
-      gatewayManagedBy = probe.managedBy;
+      if (probe.ok) {
+        gatewayStatus = 'running';
+        gatewayManagedBy = probe.managedBy;
+      } else {
+        const cliStatus = grab('Status');
+        gatewayStatus = cliStatus.includes('running') ? 'running' : 'stopped';
+      }
     } catch {
-      gatewayStatus = grab('Status');
+      const cliStatus = grab('Status');
+      gatewayStatus = cliStatus.includes('running') ? 'running' : 'stopped';
     }
     const activeSessions = grab('Active');
 
@@ -2306,6 +2317,40 @@ app.get('/api/sessions', requireAuth, async (req, res) => {
   // Short list for sidebar — limit 10, cached 10s
   const data = await getSessions();
   res.json({ sessions: data, cachedAt: hermesSidebarSessionsCache.at });
+});
+
+app.get('/api/sessions/search', requireAuth, async (req, res) => {
+  const query = String(req.query.q || '').trim().toLowerCase();
+  const profile = sanitizeProfileName(req.query.profile) || 'default';
+  if (!query) return res.json({ sessions: [] });
+
+  console.log(`[Search] query="${query}" profile="${profile}"`);
+
+  const stateDbPath = getStateDbPath(profile);
+  if (!fs.existsSync(stateDbPath)) return res.json({ sessions: [] });
+
+  let db;
+  try {
+    db = new Database(stateDbPath, { readonly: true });
+    // Search both sessions (title) and messages (content)
+    // We use LOWER() for case-insensitive matching if the DB collation isn't set up
+    const sessions = db.prepare(`
+      SELECT DISTINCT s.id, s.title, s.started_at, s.ended_at
+      FROM sessions s
+      LEFT JOIN messages m ON s.id = m.session_id
+      WHERE (LOWER(s.title) LIKE ? OR LOWER(m.content) LIKE ?)
+      ORDER BY COALESCE(s.ended_at, s.started_at) DESC
+      LIMIT 50
+    `).all(`%${query}%`, `%${query}%`);
+    
+    console.log(`[Search] Found ${sessions.length} results`);
+    res.json({ sessions });
+  } catch (e) {
+    console.error('[Search] error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    db.close();
+  }
 });
 
 app.get('/api/all-sessions', requireAuth, async (req, res) => {
@@ -2371,7 +2416,7 @@ async function getProfiles() {
     // Fix: hermes profile list doesn't update ◆ marker after `profile use`
     // Read actual active profile from ~/.hermes/active_profile
     try {
-      const activeProfilePath = path.join(os.homedir(), '.hermes', 'active_profile');
+      const activeProfilePath = path.join(CONTROL_HOME, 'active_profile');
       const actualActive = fs.existsSync(activeProfilePath)
         ? fs.readFileSync(activeProfilePath, 'utf8').trim()
         : 'default';
@@ -2707,8 +2752,8 @@ app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => 
     const search = String(req.query.search || '').toLowerCase();
 
     const profiles = profile === 'all'
-      ? ['default', ...fs.readdirSync(path.join(os.homedir(), '.hermes', 'profiles')).filter(d => {
-          try { return fs.statSync(path.join(os.homedir(), '.hermes', 'profiles', d)).isDirectory(); } catch { return false; }
+      ? ['default', ...fs.readdirSync(path.join(CONTROL_HOME, 'profiles')).filter(d => {
+          try { return fs.statSync(path.join(CONTROL_HOME, 'profiles', d)).isDirectory(); } catch { return false; }
         })]
       : [sanitizeProfileName(profile)].filter(Boolean);
 
@@ -2718,8 +2763,8 @@ app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => 
 
     for (const prof of profiles) {
       const logBase = prof === 'default'
-        ? path.join(os.homedir(), '.hermes', 'logs')
-        : path.join(os.homedir(), '.hermes', 'profiles', prof, 'logs');
+        ? path.join(CONTROL_HOME, 'logs')
+        : path.join(CONTROL_HOME, 'profiles', prof, 'logs');
 
       for (const src of sources) {
         if (src === 'gateway') {
@@ -2814,7 +2859,7 @@ app.get('/api/file', requireAuth, (req, res) => {
   if (!requested) return res.status(400).json({ error: 'path required' });
   try {
     const content = readFileSafe(requested);
-    const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
+    const HERMES = CONTROL_HOME;
     return res.json({ ok: true, path: path.resolve(HERMES, requested.replace(/^\/+/, '')), content });
   } catch (error) {
     const message = error.message || 'file read failed';
@@ -2838,7 +2883,7 @@ app.post('/api/file', requireAuth, requireCsrf, requirePerm('files.write'), (req
 // File listing API for File Explorer
 app.get('/api/files/list', requireAuth, (req, res) => {
   const dirPath = String(req.query.path || '').replace(/^\/+/, '').replace(/\.\./g, '');
-  const baseDir = path.join(os.homedir(), '.hermes');
+  const baseDir = CONTROL_HOME;
   
   // Security: ensure we stay within .hermes
   const resolved = path.resolve(baseDir, dirPath);
@@ -3404,8 +3449,8 @@ function collectOfficeEvents() {
   try {
     const logPath = path.join(CONTROL_HOME, 'hermes-agent', 'logs', 'gateway.log');
     const logPaths = [logPath];
-    // Also try standard log location
-    const altLog = '/root/.hermes/hermes-agent/gateway.log';
+    // Fallback log location (relative to home)
+    const altLog = path.join(CONTROL_HOME, 'gateway.log');
     if (altLog !== logPath && fs.existsSync(altLog)) logPaths.push(altLog);
 
     for (const lp of logPaths) {
@@ -3513,14 +3558,22 @@ app.get('/api/office/events', requireAuth, (req, res) => {
 // Open kanban.db read-only (shared across requests)
 function openKanbanDB(board) {
   const safe = (board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
-  const dbPath = path.join(CONTROL_HOME, 'kanban', 'boards', safe, 'kanban.db');
+  let dbPath = path.join(CONTROL_HOME, 'kanban', 'boards', safe, 'kanban.db');
+  if (!fs.existsSync(dbPath)) {
+    // Fallback to direct kanban.db in CONTROL_HOME
+    dbPath = path.join(CONTROL_HOME, 'kanban.db');
+  }
   if (!fs.existsSync(dbPath)) return null;
   return new Database(dbPath, { readonly: true });
 }
 
 function openKanbanDBWritable(board) {
   const safe = (board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
-  const dbPath = path.join(CONTROL_HOME, 'kanban', 'boards', safe, 'kanban.db');
+  let dbPath = path.join(CONTROL_HOME, 'kanban', 'boards', safe, 'kanban.db');
+  if (!fs.existsSync(dbPath)) {
+    // Fallback to direct kanban.db in CONTROL_HOME
+    dbPath = path.join(CONTROL_HOME, 'kanban.db');
+  }
   if (!fs.existsSync(dbPath)) return null;
   return new Database(dbPath); // writable
 }
@@ -3591,6 +3644,10 @@ app.get('/api/office/kanban/boards', requireAuth, (req, res) => {
         if (fs.existsSync(dbPath)) boards.push(d);
       }
     }
+    // Fallback: if a direct kanban.db exists in CONTROL_HOME, ensure 'main' is listed
+    if (fs.existsSync(path.join(CONTROL_HOME, 'kanban.db')) && !boards.includes('main')) {
+      boards.push('main');
+    }
     res.json({ ok: true, boards });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -3639,11 +3696,22 @@ app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, (req, res) => 
     const filePath = req.query.path || '';
 
     // Security: only allow reading within the task's workspace
-    const workspaceDir = path.join(CONTROL_HOME, 'kanban', 'boards', board, 'workspaces', taskId);
+    let workspaceDir = path.join(CONTROL_HOME, 'kanban', 'boards', board, 'workspaces', taskId);
+    if (!fs.existsSync(workspaceDir)) {
+      const altPath1 = path.join(CONTROL_HOME, 'kanban', 'workspaces', taskId);
+      const altPath2 = path.join(CONTROL_HOME, 'workspaces', taskId);
+      if (fs.existsSync(altPath1)) {
+        workspaceDir = altPath1;
+      } else if (fs.existsSync(altPath2)) {
+        workspaceDir = altPath2;
+      }
+    }
     const resolvedPath = path.resolve(workspaceDir, filePath);
 
     // Verify resolved path is within workspace directory
-    if (!resolvedPath.startsWith(path.resolve(workspaceDir))) {
+    const baseDir = path.resolve(workspaceDir);
+    const baseWithSep = baseDir.endsWith(path.sep) ? baseDir : baseDir + path.sep;
+    if (!resolvedPath.startsWith(baseWithSep) && resolvedPath !== baseDir) {
       return res.json({ ok: false, error: 'path traversal denied' });
     }
 
@@ -4176,8 +4244,8 @@ app.get('/api/config/:profile', requireAuth, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const configPath = `${home}/config.yaml`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const configPath = path.join(home, 'config.yaml');
     const raw = await shell(`cat "${configPath}" 2>/dev/null || echo "not_found"`);
     if (raw.trim() === 'not_found') {
       return res.json({ ok: false, error: 'Config not found' });
@@ -4196,8 +4264,8 @@ app.put('/api/config/:profile', requireAuth, requireRole('admin'), requireCsrf, 
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const configPath = `${home}/config.yaml`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const configPath = path.join(home, 'config.yaml');
 
     // Validate input is an object
     const newConfig = req.body?.config;
@@ -4335,8 +4403,8 @@ app.get('/api/keys/:profile', requireAuth, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const envPath = `${home}/.env`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const envPath = path.join(home, '.env');
     const raw = await shell(`cat "${envPath}" 2>/dev/null || echo ""`);
     if (!raw.trim()) {
       return res.json({ ok: true, keys: [], categories: [] });
@@ -4387,8 +4455,8 @@ app.get('/api/keys/:profile/reveal/:name', requireAuth, requireRole('admin'), as
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyName)) {
       return res.status(400).json({ ok: false, error: 'invalid key name' });
     }
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const envPath = `${home}/.env`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const envPath = path.join(home, '.env');
     const raw = await shell(`grep -E "^${keyName}=" "${envPath}" 2>/dev/null || echo ""`);
     if (!raw.trim()) {
       return res.json({ ok: false, error: 'Key not found' });
@@ -4413,8 +4481,8 @@ app.put('/api/keys/:profile', requireAuth, requireRole('admin'), requireCsrf, as
     if (typeof value !== 'string') {
       return res.status(400).json({ ok: false, error: 'value must be a string' });
     }
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const envPath = `${home}/.env`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const envPath = path.join(home, '.env');
     // Read current .env
     const raw = await shell(`cat "${envPath}" 2>/dev/null || echo ""`);
     const lines = raw.split('\n');
@@ -4448,8 +4516,8 @@ app.delete('/api/keys/:profile/:name', requireAuth, requireRole('admin'), requir
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyName)) {
       return res.status(400).json({ ok: false, error: 'invalid key name' });
     }
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const envPath = `${home}/.env`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const envPath = path.join(home, '.env');
     // Remove the key line using sed
     await shell(`sed -i '/^${keyName}=/d' "${envPath}"`);
     audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'KEY_DELETE', `${profile}:${keyName}`);
@@ -4464,8 +4532,8 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
-    const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const memoriesDir = profile === 'default' ? `${process.env.HOME}/.hermes/memories` : `${home}/memories`;
+    const home = profile === 'default' ? CONTROL_HOME : path.join(CONTROL_HOME, 'profiles', profile);
+    const memoriesDir = path.join(home, 'memories');
     const [memoryContent, userContent, soulContent, honchoConfig] = await Promise.all([
       shell(`cat "${memoriesDir}/MEMORY.md" 2>/dev/null || echo ""`),
       shell(`cat "${memoriesDir}/USER.md" 2>/dev/null || echo ""`),
@@ -4663,7 +4731,7 @@ app.post('/api/doctor', requireRole('admin'), requireCsrf, (req, res) => {
 
   const proc = spawn('script', ['-qfc', `hermes doctor ${fix}`, '/dev/null'], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
+    env: { ...process.env, HERMES_HOME: CONTROL_HOME, TERM: 'dumb' },
   });
   let fullOutput = '';
   proc.stdout.on('data', (chunk) => {
@@ -4706,7 +4774,7 @@ app.post('/api/backup/create', requireRole('admin'), requireCsrf, (req, res) => 
   // Use 'script' to fake a PTY — forces hermes CLI to line-buffer stdout
   const proc = spawn('script', ['-qfc', `hermes backup -o ${outPath}`, '/dev/null'], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
+    env: { ...process.env, HERMES_HOME: CONTROL_HOME, TERM: 'dumb' },
   });
   let fullOutput = '';
   proc.stdout.on('data', (chunk) => {
@@ -4757,7 +4825,7 @@ app.post('/api/backup/import', requireRole('admin'), requireCsrf, (req, res) => 
     // Use 'script' to fake a PTY — forces hermes CLI to line-buffer stdout
     const proc = spawn('script', ['-qfc', `hermes import ${zipPath} --force`, '/dev/null'], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
+      env: { ...process.env, HERMES_HOME: CONTROL_HOME, TERM: 'dumb' },
     });
     let fullOutput = '';
     proc.stdout.on('data', (chunk) => {
@@ -4821,7 +4889,7 @@ app.post('/api/update', requireRole('admin'), requireCsrf, (req, res) => {
 
   // hermes update --gateway uses file-based IPC for prompts (not stdin!)
   // It writes ~/.hermes/.update_prompt.json and waits for ~/.hermes/.update_response
-  const hermesHome = path.join(os.homedir(), '.hermes');
+  const hermesHome = CONTROL_HOME;
   const promptPath = path.join(hermesHome, '.update_prompt.json');
   const responsePath = path.join(hermesHome, '.update_response');
 
@@ -4940,8 +5008,8 @@ app.get('/api/sessions/:id/messages', requireAuth, (req, res) => {
     // Resolve profile-aware state.db path
     const profile = sanitizeProfileName(req.query.profile);
     const stateDbPath = profile && profile !== 'default'
-      ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-      : path.join(os.homedir(), '.hermes', 'state.db');
+      ? path.join(CONTROL_HOME, 'profiles', profile, 'state.db')
+      : path.join(CONTROL_HOME, 'state.db');
 
     if (!fs.existsSync(stateDbPath)) {
       return res.json({ ok: false, error: `state.db not found for profile: ${profile || 'default'}` });
@@ -5023,13 +5091,13 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
     let dbPaths = [];
     if (profile) {
       const p = profile !== 'default'
-        ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-        : path.join(os.homedir(), '.hermes', 'state.db');
+        ? path.join(CONTROL_HOME, 'profiles', profile, 'state.db')
+        : path.join(CONTROL_HOME, 'state.db');
       if (!fs.existsSync(p)) return res.json({ ok: false, error: 'state.db not found' });
       dbPaths = [{ profile: profile || 'default', path: p }];
     } else {
       // All profiles
-      const profilesDir = path.join(os.homedir(), '.hermes', 'profiles');
+      const profilesDir = path.join(CONTROL_HOME, 'profiles');
       if (fs.existsSync(profilesDir)) {
         for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
           if (!entry.isDirectory()) continue;
@@ -5038,7 +5106,7 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
         }
       }
       // Include default profile
-      const defaultDbPath = path.join(os.homedir(), '.hermes', 'state.db');
+      const defaultDbPath = path.join(CONTROL_HOME, 'state.db');
       if (fs.existsSync(defaultDbPath)) {
         dbPaths.push({ profile: 'default', path: defaultDbPath });
       }
@@ -5231,8 +5299,8 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
     const profile = sanitizeProfileName(req.query.profile);
     const stateDbPath = profile && profile !== 'default'
-      ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-      : path.join(os.homedir(), '.hermes', 'state.db');
+      ? path.join(CONTROL_HOME, 'profiles', profile, 'state.db')
+      : path.join(CONTROL_HOME, 'state.db');
 
     if (!fs.existsSync(stateDbPath)) {
       return res.json({ ok: false, error: 'state.db not found' });
@@ -5670,7 +5738,7 @@ app.get('/api/setup/check', requireAuth, async (req, res) => {
   }
 
   // 3. Check Python bridge (TUI gateway)
-  const pythonRoot = process.env.HERMES_PYTHON_SRC_ROOT || path.join(os.homedir(), '.hermes', 'hermes-agent');
+  const pythonRoot = process.env.HERMES_PYTHON_SRC_ROOT || path.join(CONTROL_HOME, 'hermes-agent');
   const tuiEntry = path.join(pythonRoot, 'tui_gateway', 'entry.py');
   results.push({
     check: 'tui_bridge',
@@ -5680,7 +5748,7 @@ app.get('/api/setup/check', requireAuth, async (req, res) => {
   });
 
   // 4. Check hermes config.yaml
-  const configPath = path.join(os.homedir(), '.hermes', 'config.yaml');
+  const configPath = path.join(CONTROL_HOME, 'config.yaml');
   try {
     const raw = fs.readFileSync(configPath, 'utf8');
     yaml.load(raw);
@@ -5758,7 +5826,7 @@ function _detectMcpServerAlive(serverName, serverConfig) {
 
 function _getMcpConfig() {
   try {
-    const hermesHome = path.join(os.homedir(), '.hermes');
+    const hermesHome = CONTROL_HOME;
     const profilesDir = path.join(hermesHome, 'profiles');
     const merged = {};
 
@@ -5792,7 +5860,7 @@ function _getMcpConfig() {
 }
 
 async function _saveMcpConfig(mcp) {
-  const hermesHome = path.join(os.homedir(), '.hermes');
+  const hermesHome = CONTROL_HOME;
   const profilesDir = path.join(hermesHome, 'profiles');
 
   // Find which profile has mcp_servers, or use first profile

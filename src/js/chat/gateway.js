@@ -77,12 +77,17 @@ async function sendViaGatewayAPI(text, profile, sessionId, contentDiv, messagesD
 
   // Reload messages from DB to get clean, properly rendered messages
   // (same as loading a session — ensures streaming view matches final view)
+  // Add a small delay to ensure backend has finished DB write
   if (state._currentChatSession) {
-    await reloadCurrentSessionMessages();
+    setTimeout(async () => {
+      await reloadCurrentSessionMessages();
+      await refreshChatSidebar();
+      updateChatHeader();
+    }, 500);
+  } else {
+    await refreshChatSidebar();
+    updateChatHeader();
   }
-
-  await refreshChatSidebar();
-  updateChatHeader();
 }
 
 function handleGatewayEvent(evt, contentDiv, messagesDiv, toolCards) {
@@ -229,6 +234,7 @@ function handleReasoningDelta(delta) {
 }
 
 function handleMessageStart() {
+  // Collapse previous thinking panel if it exists (BUG?)
   hideThinkingPanel();
   const messagesDiv = document.getElementById('chat-messages');
   if (!messagesDiv) return;
@@ -499,7 +505,7 @@ function ensureThinkingPanel(messagesDiv) {
     panel = document.createElement('div');
     panel.id = 'chat-thinking-panel';
     panel.className = 'chat-thinking-panel';
-    panel.innerHTML = '<div class="thinking-header" data-i18n="auto.thinking">💭 Thinking</div><div class="thinking-text"></div>';
+    panel.innerHTML = '<details open><summary class="thinking-header" data-i18n="auto.thinking">💭 Thinking</summary><div class="thinking-text"></div></details>';
     // Insert before the streaming message or at the end
     const streamEl = document.getElementById('chat-streaming');
     // Guard: streamEl might have been removed/replaced by reloadCurrentSessionMessages
@@ -515,7 +521,11 @@ function ensureThinkingPanel(messagesDiv) {
 
 function hideThinkingPanel() {
   const panel = document.getElementById('chat-thinking-panel');
-  if (panel) panel.style.display = 'none';
+  if (panel) {
+    const details = panel.querySelector('details');
+    if (details) details.open = false;
+    // Don't set display: none, just let it stay collapsed
+  }
 }
 
 function ensureToolCards() {
@@ -553,63 +563,95 @@ function finalizeWsChat() {
     if (panel && panel.children.length <= 1) panel.style.display = 'none';
   }, 6000);
 
-  // CAPTURE streaming text BEFORE removing streamEl.
+  // CAPTURE streaming text and tool cards BEFORE removing streamEl.
   // chat.done fires BEFORE Hermes finishes writing the final message to SQLite,
   // so reloadCurrentSessionMessages() may miss the streaming content.
   const streamEl = document.getElementById('chat-streaming');
   let capturedText = '';
+  let capturedTools = [];
   if (streamEl) {
     const span = streamEl.querySelector('#gw-stream-text');
     if (span) capturedText = span.textContent || '';
+    // Capture any tool call cards rendered during streaming
+    capturedTools = Array.from(streamEl.querySelectorAll('.tool-call-card')).map(el => el.cloneNode(true));
     streamEl.remove();
   }
-  // Also remove any orphaned thinking panel
+  // Also capture and move thinking panel if it has content
   const thinkEl = document.getElementById('chat-thinking-panel');
-  if (thinkEl) thinkEl.remove();
+  let capturedThinking = '';
+  if (thinkEl) {
+    const textEl = thinkEl.querySelector('.thinking-text');
+    if (textEl) capturedThinking = textEl.textContent || '';
+    thinkEl.remove();
+  }
 
   // Reload from DB for clean final render, then merge captured streaming text
   // in case the final message hadn't been written to DB yet.
-  if (state._currentChatSession) {
-    reloadCurrentSessionMessages().then(() => {
-      // Merge captured streaming text if the DB didn't persist the response in time.
-      // chat.done fires before Hermes writes to SQLite, so two cases arise:
-      //   1. DB wrote an empty assistant entry → fill its body
-      //   2. DB hasn't written the response yet → last element is the user message → append a new assistant bubble
-      if (capturedText) {
-        const messagesDiv = document.getElementById('chat-messages');
-        if (messagesDiv) {
-          const lastAssistant = messagesDiv.querySelector('.msg-assistant:last-child');
-          const lastBody = lastAssistant?.querySelector('.msg-body');
-          if (lastAssistant && lastBody && !lastBody.textContent?.trim()) {
-            // Case 1: empty assistant entry in DB
-            lastBody.innerHTML = renderChatContent(capturedText.substring(0, 8000));
-            highlightCodeBlocks(lastBody);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-          } else if (!lastAssistant) {
-            // Case 2: response not in DB yet — show captured streaming text as a placeholder bubble
-            const div = document.createElement('div');
-            div.className = 'chat-msg msg-assistant';
-            const header = document.createElement('div');
-            header.className = 'msg-header';
-            header.innerHTML = '<span class="msg-header-label">🤖 Assistant</span>';
-            const body = document.createElement('div');
-            body.className = 'msg-body';
-            body.innerHTML = renderChatContent(capturedText.substring(0, 8000));
-            div.appendChild(header);
-            div.appendChild(body);
-            messagesDiv.appendChild(div);
-            highlightCodeBlocks(div);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-          }
+  const performFinalRender = () => {
+    const messagesDiv = document.getElementById('chat-messages');
+    if (!messagesDiv) return;
+
+    const lastAssistant = messagesDiv.querySelector('.msg-assistant:last-child');
+    const lastBody = lastAssistant?.querySelector('.msg-body');
+
+    // Case 1: DB wrote an empty assistant entry OR response is still missing from DB
+    if (!lastAssistant || (lastBody && !lastBody.textContent?.trim())) {
+      if (capturedText || capturedTools.length > 0) {
+        if (lastAssistant && lastBody) {
+          lastBody.innerHTML = renderChatContent(capturedText.substring(0, 8000));
+          // Re-append captured tool cards
+          capturedTools.forEach(tc => lastAssistant.appendChild(tc));
+        } else {
+          const div = document.createElement('div');
+          div.className = 'chat-msg msg-assistant';
+          const ts = new Date().toLocaleString([], { hour: '2-digit', minute: '2-digit' });
+          const header = document.createElement('div');
+          header.className = 'msg-header';
+          const labels = { assistant: { label: 'Assistant', icon: '🤖' } };
+          const c = labels.assistant;
+          header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span><span class="msg-header-time">${ts}</span><button class="msg-menu-btn" onclick="toggleMsgMenu(event, 'assistant')" title="Message options">⋮</button>`;
+          const body = document.createElement('div');
+          body.className = 'msg-body';
+          body.innerHTML = renderChatContent(capturedText.substring(0, 8000));
+          div.appendChild(header);
+          div.appendChild(body);
+          // Re-append captured tool cards
+          capturedTools.forEach(tc => div.appendChild(tc));
+          messagesDiv.appendChild(div);
         }
       }
-    }).finally(() => {
-      state._finalizeInProgress = false;
-    }).catch((e) => {
-      state._finalizeInProgress = false;
-      console.error('[Chat] reload error:', e);
-    });
+    } else if (lastAssistant && capturedTools.length > 0 && !lastAssistant.querySelector('.tool-call-card')) {
+      // Case 2: DB has text but missing tool calls (race condition)
+      capturedTools.forEach(tc => lastAssistant.appendChild(tc));
+    }
+
+    // Re-apply reasoning if captured and not already in the reloaded message
+    const targetAssistant = messagesDiv.querySelector('.msg-assistant:last-child');
+    if (capturedThinking && targetAssistant && !targetAssistant.querySelector('details')) {
+      const rd = document.createElement('details');
+      rd.style.cssText = 'margin-top:8px;';
+      rd.innerHTML = `<summary style="cursor:pointer;font-size:11px;color:var(--fg-subtle);" data-i18n="auto.reasoning">💭 Reasoning</summary><div class="msg-tool-result" style="margin-top:4px;">${escapeHtml(capturedThinking.substring(0, 2000))}</div>`;
+      targetAssistant.appendChild(rd);
+    }
+    
+    highlightCodeBlocks(messagesDiv);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  };
+
+  if (state._currentChatSession) {
+    // Add a small delay to ensure backend has finished DB write
+    setTimeout(() => {
+      reloadCurrentSessionMessages()
+        .then(performFinalRender)
+        .finally(() => { state._finalizeInProgress = false; })
+        .catch((e) => {
+          state._finalizeInProgress = false;
+          console.error('[Chat] reload error:', e);
+          performFinalRender(); // fallback to local render
+        });
+    }, 500);
   } else {
+    performFinalRender();
     state._finalizeInProgress = false;
   }
   refreshChatSidebar();

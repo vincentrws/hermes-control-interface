@@ -267,6 +267,17 @@ function createMessageDiv(role, content, optId) {
   const div = document.createElement('div');
   div.className = `chat-msg ${cls}`;
   if (optId) div.dataset.optId = optId;
+
+  // Header
+  const userLabel = state.user?.username || 'You';
+  const labels = { user: { label: userLabel, icon: '👤' }, assistant: { label: 'Assistant', icon: '🤖' } };
+  const c = labels[role] || { label: 'System', icon: '⚙️' };
+  const ts = new Date().toLocaleString([], { hour: '2-digit', minute: '2-digit' });
+  const header = document.createElement('div');
+  header.className = 'msg-header';
+  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span><span class="msg-header-time">${ts}</span><button class="msg-menu-btn" onclick="toggleMsgMenu(event, '${role}')" title="Message options">⋮</button>`;
+  div.appendChild(header);
+
   const body = document.createElement('div');
   body.className = 'msg-body';
   body.textContent = content;

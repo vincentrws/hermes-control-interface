@@ -1332,10 +1332,10 @@
 .msg-menu-dropdown {
   position: absolute;
   z-index: 1000;
-  background: var(--bg-card);
+  background: var(--bg-base); /* Using bg-base for solid background */
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.6);
   min-width: 160px;
   padding: 4px;
 }

@@ -227,11 +227,63 @@ async function loadChat(container) {
   });
 
   // Session search
+  let searchTimeout = null;
   document.getElementById('chat-session-search')?.addEventListener('input', (e) => {
     const q = e.target.value.toLowerCase();
-    document.querySelectorAll('#chat-sidebar-list .chat-session-item').forEach(el => {
-      el.style.display = el.dataset?.title?.toLowerCase().includes(q) || el.dataset?.sid?.toLowerCase().includes(q) ? '' : 'none';
+    
+    // Local filter (instant)
+    const items = document.querySelectorAll('#chat-sidebar-list .chat-session-item');
+    items.forEach(el => {
+      const match = el.dataset?.title?.toLowerCase().includes(q) || el.dataset?.sid?.toLowerCase().includes(q) || el.classList.contains('deep-match');
+      el.style.display = (match || !q) ? '' : 'none';
+      // Remove deep search results that no longer match local title/sid if search query changes
+      // but keep them if they were explicitly marked as deep matches
+      if (!match && el.classList.contains('search-result') && !el.classList.contains('deep-match')) el.remove();
     });
+
+    // Deep search (debounced)
+    clearTimeout(searchTimeout);
+    if (q.length >= 3) {
+      searchTimeout = setTimeout(async () => {
+        const profile = document.getElementById('chat-profile')?.value || 'default';
+        try {
+          const res = await fetch(`/api/sessions/search?q=${encodeURIComponent(q)}&profile=${encodeURIComponent(profile)}`);
+          if (res.ok) {
+            const data = await res.json();
+            const foundSids = new Set(data.sessions?.map(s => s.id) || []);
+            
+            // Update existing items
+            items.forEach(el => {
+              if (foundSids.has(el.dataset.sid)) {
+                el.classList.add('deep-match');
+                el.style.display = '';
+              } else {
+                el.classList.remove('deep-match');
+              }
+            });
+
+            if (data.sessions?.length > 0) {
+              const list = document.getElementById('chat-sidebar-list');
+              const existingSids = new Set(Array.from(items).map(el => el.dataset.sid));
+              data.sessions.forEach(s => {
+                if (!existingSids.has(s.id)) {
+                  const item = document.createElement('div');
+                  item.className = 'chat-session-item search-result deep-match';
+                  item.dataset.sid = s.id;
+                  item.dataset.title = s.title || s.id;
+                  item.onclick = () => loadChatSession(s.id);
+                  item.innerHTML = `<div class="session-title">${escapeHtml(s.title || s.id)}</div><div class="session-meta">${new Date(s.started_at * 1000).toLocaleDateString()}</div>`;
+                  list.appendChild(item);
+                }
+              });
+            }
+          }
+        } catch {}
+      }, 500);
+    } else {
+      // Clear deep match markers if query too short
+      items.forEach(el => el.classList.remove('deep-match'));
+    }
   });
 
   // Auto-resize textarea + save draft
@@ -584,7 +636,7 @@ function renderChatMessage(msg) {
   // Header
   const header = document.createElement('div');
   header.className = 'msg-header';
-  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}<button class="msg-menu-btn" onclick="toggleMsgMenu(this, '${role}')" title="Message options">⋮</button>`;
+  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}<button class="msg-menu-btn" onclick="toggleMsgMenu(event, '${role}')" title="Message options">⋮</button>`;
   div.appendChild(header);
 
   // Tool calls — render as collapsible cards
@@ -877,6 +929,8 @@ async function sendChatMessage() {
   if (messagesDiv) {
     const existing = messagesDiv.querySelector('[style*="text-align:center"]');
     if (existing) existing.remove();
+    const welcome = messagesDiv.querySelector('.chat-welcome');
+    if (welcome) welcome.remove();
     // Optimistic ID: tag user message so we can swap if needed
     const optId = 'opt-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
     const msgEl = createMessageDiv('user', text, optId);
@@ -888,7 +942,7 @@ async function sendChatMessage() {
   const streamEl = document.createElement('div');
   streamEl.id = 'chat-streaming';
   streamEl.className = 'chat-msg msg-assistant';
-  streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label" data-i18n="auto.assistant">🤖 Assistant</span></div><div class="msg-body"><span class="streaming-text" id="gw-stream-text"><span class="chat-cursor">▊</span></span></div>';
+  streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label" data-i18n="auto.assistant">🤖 Assistant</span><button class="msg-menu-btn" onclick="toggleMsgMenu(event, \'assistant\')" title="Message options">⋮</button></div><div class="msg-body"><span class="streaming-text" id="gw-stream-text"><span class="chat-cursor">▊</span></span></div>';
   if (messagesDiv) messagesDiv.appendChild(streamEl);
   if (messagesDiv) messagesDiv.scrollTop = messagesDiv.scrollHeight;
   const contentDiv = streamEl.querySelector('#gw-stream-text') || streamEl.querySelector('.msg-body');

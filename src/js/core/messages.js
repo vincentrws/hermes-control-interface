@@ -1,5 +1,12 @@
 import { forkFromMessage } from '../chat/core.js';
-function toggleMsgMenu(btn, role) {
+function toggleMsgMenu(ev, role) {
+  // Prevent event from bubbling to document click listener
+  if (ev) {
+    ev.stopPropagation();
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  const btn = ev.currentTarget || ev.target || ev;
+  
   // Close any existing menu first
   closeMsgMenu();
   // Build menu
@@ -10,7 +17,14 @@ function toggleMsgMenu(btn, role) {
   // Position it relative to the button
   const rect = btn.getBoundingClientRect();
   menu.style.top = rect.bottom + window.scrollY + 2 + 'px';
-  menu.style.left = rect.left + window.scrollX + 'px';
+  
+  // Check for right-edge overflow
+  const menuWidth = 160; // Approximate min-width from CSS
+  if (rect.left + menuWidth > window.innerWidth - 10) {
+    menu.style.left = (rect.right + window.scrollX - menuWidth) + 'px';
+  } else {
+    menu.style.left = rect.left + window.scrollX + 'px';
+  }
   // Store message index on the menu for the fork handler
   const msgDiv = btn.closest('.chat-msg');
   const msgs = Array.from(msgDiv.parentElement.querySelectorAll('.chat-msg'));
