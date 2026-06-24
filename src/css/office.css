@@ -492,10 +492,11 @@
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: 9999;
-  width: 420px;
+  width: 50%;
   max-width: 92vw;
   max-height: 82vh;
-  overflow-y: auto;
+  overflow: auto;
+  resize: both;
   background: var(--bg);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
@@ -851,6 +852,16 @@
   font-size: 11px;
   padding: 3px 0;
   color: var(--fg-muted);
+}
+.kb-attach--file { cursor: pointer; }
+.kb-attach--file:hover { color: var(--accent); }
+.kb-attach--empty { font-style: italic; opacity: 0.7; }
+.kb-attach--missing { opacity: 0.8; }
+.kb-attach-note {
+  margin-left: 8px;
+  font-size: 10px;
+  font-style: italic;
+  opacity: 0.65;
 }
 
 /* ── Status Color Classes ────────────────────────────────── */

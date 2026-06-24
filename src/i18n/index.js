@@ -68,21 +68,25 @@ export function getLocale() { return _locale; }
 
 export function applyTranslations(root) {
   root = root || document;
+  // Write only when the value actually changes. Writing textContent is itself a
+  // DOM mutation, and a MutationObserver in main.js re-invokes this on every
+  // mutation — so unconditional writes create a perpetual re-translate loop that
+  // (among other things) rebuilds open <select> dropdowns mid-interaction.
   root.querySelectorAll('[data-i18n]').forEach(el => {
-    const key = el.getAttribute('data-i18n');
-    el.textContent = t(key);
+    const val = t(el.getAttribute('data-i18n'));
+    if (el.textContent !== val) el.textContent = val;
   });
   root.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-    const key = el.getAttribute('data-i18n-placeholder');
-    el.setAttribute('placeholder', t(key));
+    const val = t(el.getAttribute('data-i18n-placeholder'));
+    if (el.getAttribute('placeholder') !== val) el.setAttribute('placeholder', val);
   });
   root.querySelectorAll('[data-i18n-title]').forEach(el => {
-    const key = el.getAttribute('data-i18n-title');
-    el.setAttribute('title', t(key));
+    const val = t(el.getAttribute('data-i18n-title'));
+    if (el.getAttribute('title') !== val) el.setAttribute('title', val);
   });
   root.querySelectorAll('[data-i18n-aria]').forEach(el => {
-    const key = el.getAttribute('data-i18n-aria');
-    el.setAttribute('aria-label', t(key));
+    const val = t(el.getAttribute('data-i18n-aria'));
+    if (el.getAttribute('aria-label') !== val) el.setAttribute('aria-label', val);
   });
 }
 

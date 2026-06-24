@@ -6,6 +6,7 @@ let _lastUsageData = null;
 const _charts = {};
 
 async function loadUsage(container) {
+  const savedDays = localStorage.getItem('hci_usage_days') || '7';
   container.innerHTML = `
     <div class="page-header">
       <div>
@@ -14,10 +15,10 @@ async function loadUsage(container) {
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <select id="usage-days" class="log-level-select">
-          <option value="1" data-i18n="auto.today">Today</option>
-          <option value="7" selected data-i18n="auto.7Days">7 days</option>
-          <option value="30" data-i18n="auto.30Days">30 days</option>
-          <option value="90" data-i18n="auto.90Days">90 days</option>
+          <option value="1" ${savedDays === '1' ? 'selected' : ''} data-i18n="auto.today">Today</option>
+          <option value="7" ${savedDays === '7' ? 'selected' : ''} data-i18n="auto.7Days">7 days</option>
+          <option value="30" ${savedDays === '30' ? 'selected' : ''} data-i18n="auto.30Days">30 days</option>
+          <option value="90" ${savedDays === '90' ? 'selected' : ''} data-i18n="auto.90Days">90 days</option>
         </select>
         <select id="usage-agent" class="log-level-select">
           <option value="" data-i18n="auto.allAgents">All agents</option>
@@ -98,6 +99,17 @@ async function loadUsage(container) {
   } catch (e) {
     // ignore
   }
+
+  // Days dropdown change handler
+  const daysSelect = document.getElementById('usage-days');
+  if (daysSelect && !daysSelect.dataset._bound) {
+    daysSelect.dataset._bound = '1';
+    daysSelect.addEventListener('change', () => {
+      localStorage.setItem('hci_usage_days', daysSelect.value);
+      fetchUsageData();
+    });
+  }
+
   // Budget input change handler — prevent duplicate listeners
   const budgetInput = document.getElementById('usage-budget');
   if (budgetInput && !budgetInput.dataset._bound) {
@@ -113,6 +125,9 @@ async function loadUsage(container) {
       if (_lastUsageData) renderUsageCharts(_lastUsageData.d, _lastUsageData.daily);
     });
   }
+
+  // Populate the tab on open (otherwise it shows only labels until Apply).
+  fetchUsageData();
 }
 
 async function fetchUsageData() {
@@ -188,7 +203,11 @@ async function fetchUsageData() {
     const modelsEl = document.getElementById('usage-models-list');
     if (modelsEl) {
       modelsEl.innerHTML = d.models && d.models.length > 0
-        ? d.models.map(m => `<div class="stat-row"><span class="stat-label">${escapeHtml(m.name)}</span><span class="stat-value">${m.sessions} · ${formatNumber(m.tokens)}</span></div>`).join('')
+        ? d.models.map(m => {
+            const costStr = (typeof m.cost === 'number') ? ` · $${m.cost.toFixed(2)}` : '';
+            const badge = m.unpriced ? ' <span class="badge-unpriced" title="No pricing data for this model">⚠ unpriced</span>' : '';
+            return `<div class="stat-row"><span class="stat-label">${escapeHtml(m.name)}</span><span class="stat-value">${m.sessions} · ${formatNumber(m.tokens)}${costStr}${badge}</span></div>`;
+          }).join('')
         : '<div class="stat-row"><span class="stat-label" data-i18n="auto.noData">No data</span></div>';
     }
 

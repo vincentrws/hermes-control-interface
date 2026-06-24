@@ -35,50 +35,141 @@ const PROVIDER_MAP = {
   'openrouter':    'openrouter',
   'openai-codex':  'openai',
   'opencode-go':   'openrouter', // minimax available via OpenRouter pricing
+  'google':        'google',
+  'gemini':        'google',      // Hermes labels Gemini sessions 'gemini'
+  'anthropic':     'anthropic',
+  'openai':        'openai',
 };
 
-// Custom pricing for models not in genai-prices (per million tokens)
+// Build the set of lookup keys to try for a model string, most-specific first.
+// Handles provider prefixes ("prov:model", "prov/model") and volatile suffixes
+// (date stamps, -preview, -latest, -exp) so newer variants still match.
+function modelLookupKeys(model) {
+  const keys = [];
+  const push = (k) => { if (k && !keys.includes(k)) keys.push(k); };
+  const raw = String(model);
+  push(raw);
+  const lower = raw.toLowerCase();
+  push(lower);
+  // strip a leading "provider:" or "provider/" segment
+  const noPrefix = lower.includes(':') ? lower.split(':').pop()
+                 : lower.includes('/') ? lower.split('/').pop()
+                 : lower;
+  push(noPrefix);
+  // strip volatile suffixes: trailing -YYYYMMDD, -latest, -preview, -exp, -NN-NN
+  let base = noPrefix
+    .replace(/-\d{8}$/, '')
+    .replace(/-(latest|preview|exp|experimental)$/g, '')
+    .replace(/-\d{2}-\d{2}$/, '');
+  // apply repeatedly (e.g. "...-preview-0514")
+  let prev;
+  do { prev = base; base = base.replace(/-(latest|preview|exp|experimental|\d{8}|\d{2}-\d{2})$/g, ''); } while (base !== prev);
+  push(base);
+  return keys;
+}
+
+// ── Dynamic Pricing Cache ──
+let DYNAMIC_PRICING = {};
+
+async function refreshDynamicPricing() {
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models');
+    if (!res.ok) return;
+    const data = await res.json();
+    const newPricing = {};
+    for (const m of data.data) {
+      if (m.pricing && m.pricing.prompt && m.pricing.completion) {
+        const entry = {
+          input_mtok: parseFloat(m.pricing.prompt) * 1e6,
+          output_mtok: parseFloat(m.pricing.completion) * 1e6,
+          // genai/openrouter expose cache read price; fall back to 10% of input
+          cache_read_mtok: m.pricing.input_cache_read != null
+            ? parseFloat(m.pricing.input_cache_read) * 1e6
+            : parseFloat(m.pricing.prompt) * 1e6 * 0.1,
+        };
+        // Index under the full id and every normalized alias, so future
+        // models (e.g. new gemini-* variants) self-price without code changes.
+        // Don't clobber a more-specific entry already set this refresh.
+        for (const k of modelLookupKeys(m.id)) {
+          if (!newPricing[k]) newPricing[k] = entry;
+        }
+      }
+    }
+    DYNAMIC_PRICING = newPricing;
+    console.log(`[Pricing] Refreshed dynamic pricing for ${data.data.length} models (${Object.keys(newPricing).length} keys).`);
+  } catch (err) {
+    console.error(`[Pricing] Failed to refresh dynamic pricing: ${err.message}`);
+  }
+}
+refreshDynamicPricing();
+setInterval(refreshDynamicPricing, 12 * 60 * 60 * 1000);
+
+// Offline fallback pricing for models not in genai-prices or the live feed
+// (per million tokens). The dynamic feed self-updates; this is the backstop.
 const CUSTOM_PRICING = {
   'minimax-m2':   { input_mtok: 0.30, output_mtok: 1.20, cache_read_mtok: 0.03 },
   'minimax-m2.7': { input_mtok: 0.30, output_mtok: 1.20, cache_read_mtok: 0.03 },
+  'gemini-1.5-pro':  { input_mtok: 3.50, output_mtok: 10.50, cache_read_mtok: 0.875 },
+  'gemini-1.5-flash': { input_mtok: 0.075, output_mtok: 0.30, cache_read_mtok: 0.01875 },
+  'gemini-2.5-pro':  { input_mtok: 1.25, output_mtok: 10.00, cache_read_mtok: 0.3125 },
+  'gemini-2.5-flash': { input_mtok: 0.30, output_mtok: 2.50, cache_read_mtok: 0.075 },
+  'gemini-2.5-flash-lite': { input_mtok: 0.10, output_mtok: 0.40, cache_read_mtok: 0.025 },
+  'gemini-3.1-pro-preview': { input_mtok: 3.50, output_mtok: 10.50, cache_read_mtok: 0.875 },
+  'gemini-3.1-flash-lite': { input_mtok: 0.10, output_mtok: 0.40, cache_read_mtok: 0.025 },
+  'claude-3-5-sonnet-20240620': { input_mtok: 3.00, output_mtok: 15.00, cache_read_mtok: 0.30 },
+  'gpt-4o-2024-05-13': { input_mtok: 5.00, output_mtok: 15.00, cache_read_mtok: 0.50 },
 };
 
-// Calculate cost in USD from token counts
+// Track models we couldn't price, so we log each only once.
+const _unpricedModelsLogged = new Set();
+
+// Calculate cost in USD from token counts. Returns { cost, priced } where
+// priced=false means tokens were present but no pricing source matched.
 function calculateCost(model, inputTokens, outputTokens, cacheReadTokens = 0, billingProvider) {
-  if (!model || FREE_MODELS.has(model)) return 0;
+  if (!model || FREE_MODELS.has(model)) return { cost: 0, priced: true };
 
   // genai-prices expects input_tokens = total input (including cache)
-  // Our DB stores input and cache separately, so combine them
   const usage = {
     input_tokens: inputTokens + cacheReadTokens,
     output_tokens: outputTokens,
     cache_read_tokens: cacheReadTokens,
   };
+  const keys = modelLookupKeys(model);
+  const fromRates = (p) => (inputTokens / 1e6) * p.input_mtok
+    + (outputTokens / 1e6) * p.output_mtok
+    + (cacheReadTokens / 1e6) * (p.cache_read_mtok != null ? p.cache_read_mtok : p.input_mtok * 0.1);
 
-  // 1. Try with provider hint
+  // 0. Dynamic pricing (live OpenRouter feed), by normalized key
+  for (const k of keys) {
+    if (DYNAMIC_PRICING[k]) return { cost: fromRates(DYNAMIC_PRICING[k]), priced: true };
+  }
+
+  // 1. genai-prices with provider hint
   const providerId = PROVIDER_MAP[billingProvider];
   if (providerId) {
-    try {
-      const r = calcPrice(usage, model, { providerId });
-      if (r) return r.total_price;
-    } catch (_) { /* fallback to next */ }
+    for (const k of keys) {
+      try { const r = calcPrice(usage, k, { providerId }); if (r) return { cost: r.total_price, priced: true }; }
+      catch (_) { /* try next key */ }
+    }
   }
 
-  // 2. Try without provider (match across all providers)
-  try {
-    const r = calcPrice(usage, model);
-    if (r) return r.total_price;
-  } catch (_) { /* fallback to custom pricing */ }
-
-  // 3. Custom pricing fallback
-  const custom = CUSTOM_PRICING[model];
-  if (custom) {
-    return (inputTokens / 1e6) * custom.input_mtok
-      + (outputTokens / 1e6) * custom.output_mtok
-      + (cacheReadTokens / 1e6) * (custom.cache_read_mtok || custom.input_mtok * 0.1);
+  // 2. genai-prices without provider (match across all providers)
+  for (const k of keys) {
+    try { const r = calcPrice(usage, k); if (r) return { cost: r.total_price, priced: true }; }
+    catch (_) { /* try next key */ }
   }
 
-  return 0;
+  // 3. Custom offline fallback
+  for (const k of keys) {
+    if (CUSTOM_PRICING[k]) return { cost: fromRates(CUSTOM_PRICING[k]), priced: true };
+  }
+
+  // No pricing found — surface it once for visibility.
+  if (!_unpricedModelsLogged.has(model)) {
+    _unpricedModelsLogged.add(model);
+    console.warn(`[Pricing] unpriced model: ${model} (provider=${billingProvider || 'none'})`);
+  }
+  return { cost: 0, priced: false };
 }
 
 // Async shell execution utility (non-blocking)
@@ -2631,8 +2722,11 @@ app.get('/api/gateway/:profile/logs', requireAuth, async (req, res) => {
     } else if (logType === 'error') {
       const logPath = path.join(CONTROL_HOME, 'logs', 'errors.log');
       logs = await shell(`tail -n ${lines} "${logPath}" 2>/dev/null || echo "No error log found"`, '10s');
+    } else if (logType === 'gateway') {
+      const logPath = path.join(CONTROL_HOME, 'logs', 'gateway.log');
+      logs = await shell(`tail -n ${lines} "${logPath}" 2>/dev/null || echo "No gateway log found"`, '10s');
     } else {
-      // Gateway logs via journalctl
+      // Gateway logs via journalctl (fallback for non-docker)
       logs = await shell(`journalctl ${SYSTEMD_USER_FLAG} -u ${svc} --no-pager -n ${lines} 2>&1`, '10s');
     }
     res.json({ ok: true, profile, service: svc, logType, logs: logs.trim() });
@@ -2751,13 +2845,14 @@ app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => 
     const level = String(req.query.level || '').toLowerCase(); // error, warn, info, debug
     const search = String(req.query.search || '').toLowerCase();
 
+    const profilesPath = path.join(CONTROL_HOME, 'profiles');
     const profiles = profile === 'all'
-      ? ['default', ...fs.readdirSync(path.join(CONTROL_HOME, 'profiles')).filter(d => {
-          try { return fs.statSync(path.join(CONTROL_HOME, 'profiles', d)).isDirectory(); } catch { return false; }
+      ? ['default', ...(fs.existsSync(profilesPath) ? fs.readdirSync(profilesPath) : []).filter(d => {
+          try { return fs.statSync(path.join(profilesPath, d)).isDirectory(); } catch { return false; }
         })]
       : [sanitizeProfileName(profile)].filter(Boolean);
 
-    const sources = source === 'all' ? ['agent', 'error'] : [source];
+    const sources = source === 'all' ? ['agent', 'error', 'gateway'] : [source];
 
     let allLines = [];
 
@@ -2768,9 +2863,15 @@ app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => 
 
       for (const src of sources) {
         if (src === 'gateway') {
-          // Gateway logs from journalctl
-          const svc = prof === 'default' ? 'hermes-gateway' : `hermes-gateway-${prof}`;
-          const raw = await shell(`journalctl ${SYSTEMD_USER_FLAG} -u ${svc} --no-pager -n ${lines} 2>&1`, '10s');
+          // Gateway logs: try direct file first (Docker), then journalctl (Systemd)
+          const logFile = path.join(logBase, 'gateway.log');
+          let raw = '';
+          if (fs.existsSync(logFile)) {
+            raw = await shell(`tail -n ${lines} "${logFile}" 2>/dev/null`, '5s');
+          } else {
+            const svc = prof === 'default' ? 'hermes-gateway' : `hermes-gateway-${prof}`;
+            raw = await shell(`journalctl ${SYSTEMD_USER_FLAG} -u ${svc} --no-pager -n ${lines} 2>&1`, '10s');
+          }
           for (const line of raw.split('\n').filter(Boolean)) {
             allLines.push(parseLogLine(line, prof, 'gateway'));
           }
@@ -2810,12 +2911,16 @@ app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => 
 
 // Parse a log line into structured format
 function parseLogLine(line, profile, source) {
+  // Debug log to trace parsing if needed
+  // console.log(`[parseLogLine] ${source} | ${line}`);
+
   // Try to extract: [TIMESTAMP] [LEVEL] [COMPONENT] message
+  // Robust match for [2026-06-24T18:49:12.345Z] [INFO] [Agent] Message
   const match = line.match(/^\[([^\]]+)\]\s*\[([^\]]+)\]\s*(?:\[([^\]]+)\]\s*)?(.+)$/);
   if (match) {
     const [, ts, lvl, comp, msg] = match;
     return {
-      ts: new Date(ts).getTime() || 0,
+      ts: new Date(ts.replace(/-/g, '/')).getTime() || 0,
       timestamp: ts,
       level: lvl.toLowerCase(),
       component: comp || source,
@@ -2825,7 +2930,43 @@ function parseLogLine(line, profile, source) {
       raw: line,
     };
   }
+
+  // 2026-06-24 18:57:52,489 INFO ...
+  const altMatch = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:,\d+)?)\s+([A-Z]+)\s+(.+)$/);
+  if (altMatch) {
+    const [, ts, lvl, body] = altMatch;
+    return {
+      ts: new Date(ts.replace(/-/g, '/').replace(',', '.')).getTime() || 0,
+      timestamp: ts,
+      level: lvl.toLowerCase(),
+      component: source,
+      profile,
+      source,
+      message: body.trim(),
+      raw: line,
+    };
+  }
   // Fallback: journalctl format or plain line
+  // Journalctl usually starts with "Jun 24 18:49:12 ..."
+  const journalMatch = line.match(/^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.+)$/);
+  if (journalMatch) {
+    const [, ts, host, body] = journalMatch;
+    let lvl = 'info';
+    if (/error|fail|fatal|crash/i.test(body)) lvl = 'error';
+    else if (/warn/i.test(body)) lvl = 'warn';
+
+    return {
+      ts: new Date(`${ts} ${new Date().getFullYear()}`).getTime() || 0,
+      timestamp: ts,
+      level: lvl,
+      component: source,
+      profile,
+      source,
+      message: body.trim(),
+      raw: line,
+    };
+  }
+
   // Try to detect level from content
   let level = 'info';
   if (/error|fail|fatal|crash/i.test(line)) level = 'error';
@@ -3669,9 +3810,83 @@ app.get('/api/office/kanban/:taskId', requireAuth, (req, res) => {
     const events = db.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at DESC LIMIT 50').all(taskId);
     const comments = db.prepare('SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at DESC LIMIT 20').all(taskId);
     const attachments = db.prepare('SELECT id, task_id, filename, content_type, size, uploaded_by, created_at FROM task_attachments WHERE task_id = ? ORDER BY created_at DESC LIMIT 20').all(taskId);
+
+    // Also look for files in the workspace directory that might not be in task_attachments
+    let workspaceDir = path.join(CONTROL_HOME, 'kanban', 'boards', board, 'workspaces', taskId);
+    if (!fs.existsSync(workspaceDir)) {
+      const altPath1 = path.join(CONTROL_HOME, 'kanban', 'workspaces', taskId);
+      const altPath2 = path.join(CONTROL_HOME, 'workspaces', taskId);
+      if (fs.existsSync(altPath1)) workspaceDir = altPath1;
+      else if (fs.existsSync(altPath2)) workspaceDir = altPath2;
+    }
+
+    if (fs.existsSync(workspaceDir)) {
+      try {
+        const files = fs.readdirSync(workspaceDir);
+        for (const f of files) {
+          if (f.startsWith('.') || f === 'node_modules') continue;
+          if (attachments.some(a => a.filename === f)) continue;
+          const stat = fs.statSync(path.join(workspaceDir, f));
+          if (stat.isFile()) {
+            attachments.push({
+              id: `ws-${f}`,
+              task_id: taskId,
+              filename: f,
+              content_type: 'application/octet-stream',
+              size: stat.size,
+              uploaded_by: 'workspace',
+              created_at: stat.mtimeMs / 1000
+            });
+          }
+        }
+      } catch {}
+    }
     const links = db.prepare('SELECT * FROM task_links WHERE parent_id = ? OR child_id = ?').all(taskId, taskId);
 
     db.close();
+
+    // Recorded artifacts: paths referenced in run metadata + completed/done event
+    // payloads. These may no longer exist on disk (scratch workspaces are deleted
+    // on completion), so we surface them as attachments flagged with exists/source.
+    const recordedPaths = new Set();
+    for (const r of runs) {
+      let meta = null;
+      try { if (r.metadata) meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata; } catch {}
+      if (meta && Array.isArray(meta.artifacts)) meta.artifacts.forEach(a => a && recordedPaths.add(String(a)));
+    }
+    for (const e of events) {
+      if (e.kind !== 'completed' && e.kind !== 'done') continue;
+      let payload = null;
+      try { if (e.payload) payload = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload; } catch {}
+      if (payload && Array.isArray(payload.artifacts)) payload.artifacts.forEach(a => a && recordedPaths.add(String(a)));
+    }
+    for (const abs of recordedPaths) {
+      const filename = abs.split('/').pop();
+      if (attachments.some(a => a.filename === filename)) continue;
+      let exists = false, size = null;
+      try { const st = fs.statSync(abs); exists = st.isFile(); size = st.size; } catch {}
+      attachments.push({
+        id: `rec-${filename}`,
+        task_id: taskId,
+        filename,
+        path: abs,
+        content_type: 'application/octet-stream',
+        size,
+        uploaded_by: 'recorded',
+        source: 'recorded',
+        exists,
+        created_at: null,
+      });
+    }
+
+    // Worker log presence (loaded on demand via /worker-log) — content survives
+    // even when the scratch workspace files were deleted.
+    let workerLog = { exists: false };
+    try {
+      const logPath = path.join(CONTROL_HOME, 'kanban', 'logs', `${taskId}.log`);
+      const st = fs.statSync(logPath);
+      if (st.isFile()) workerLog = { exists: true, size: st.size };
+    } catch {}
 
     res.json({
       ok: true,
@@ -3680,6 +3895,7 @@ app.get('/api/office/kanban/:taskId', requireAuth, (req, res) => {
       events,
       comments,
       attachments,
+      workerLog,
       links,
       timestamp: Date.now(),
     });
@@ -3708,11 +3924,23 @@ app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, (req, res) => 
     }
     const resolvedPath = path.resolve(workspaceDir, filePath);
 
-    // Verify resolved path is within workspace directory
-    const baseDir = path.resolve(workspaceDir);
-    const baseWithSep = baseDir.endsWith(path.sep) ? baseDir : baseDir + path.sep;
-    if (!resolvedPath.startsWith(baseWithSep) && resolvedPath !== baseDir) {
-      return res.json({ ok: false, error: 'path traversal denied' });
+    // Recorded artifacts use absolute paths that may live outside the scanned
+    // workspace dir (e.g. preserved dir:/worktree: workspaces). Allow absolute
+    // paths only when confined to CONTROL_HOME; otherwise require the resolved
+    // path to stay within the task's workspace directory.
+    const home = path.resolve(CONTROL_HOME);
+    const homeWithSep = home.endsWith(path.sep) ? home : home + path.sep;
+    const isAbsolute = path.isAbsolute(filePath);
+    if (isAbsolute) {
+      if (!resolvedPath.startsWith(homeWithSep) && resolvedPath !== home) {
+        return res.json({ ok: false, error: 'path traversal denied' });
+      }
+    } else {
+      const baseDir = path.resolve(workspaceDir);
+      const baseWithSep = baseDir.endsWith(path.sep) ? baseDir : baseDir + path.sep;
+      if (!resolvedPath.startsWith(baseWithSep) && resolvedPath !== baseDir) {
+        return res.json({ ok: false, error: 'path traversal denied' });
+      }
     }
 
     if (!fs.existsSync(resolvedPath)) {
@@ -3746,6 +3974,44 @@ app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, (req, res) => 
       size: stat.size,
       mtime: stat.mtimeMs,
       language: isCode ? ext.replace('.', '') : 'text',
+      content,
+    });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ── Read the worker log for a kanban task ────────────────────────────────────
+// Logs live at <CONTROL_HOME>/kanban/logs/<taskId>.log and survive even when the
+// task's scratch workspace (and its artifact files) were deleted on completion.
+app.get('/api/office/kanban/:taskId/worker-log', requireAuth, (req, res) => {
+  try {
+    const taskId = String(req.params.taskId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const logPath = path.join(CONTROL_HOME, 'kanban', 'logs', `${taskId}.log`);
+    if (!fs.existsSync(logPath)) {
+      return res.json({ ok: false, error: 'worker log not found' });
+    }
+    const stat = fs.statSync(logPath);
+    const MAX = 512000; // 500KB
+    let content;
+    if (stat.size > MAX) {
+      // Tail the last MAX bytes for oversized logs
+      const fd = fs.openSync(logPath, 'r');
+      try {
+        const buf = Buffer.alloc(MAX);
+        fs.readSync(fd, buf, 0, MAX, stat.size - MAX);
+        content = '…[truncated to last 500KB]…\n' + buf.toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      content = fs.readFileSync(logPath, 'utf8');
+    }
+    res.json({
+      ok: true,
+      filename: `${taskId}.log`,
+      size: stat.size,
+      mtime: stat.mtimeMs,
       content,
     });
   } catch (e) {
@@ -5120,6 +5386,9 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
     let totalSessions = 0, totalMessages = 0, totalToolCalls = 0;
     let totalInput = 0, totalOutput = 0, totalCost = 0;
 
+    console.log(`[Usage] Aggregating usage for last ${days} days across ${dbPaths.length} DBs:`, dbPaths.map(d => d.profile).join(', '));
+    console.log(`[Pricing] DYNAMIC_PRICING status: ${Object.keys(DYNAMIC_PRICING).length} models cached.`);
+
     for (const { path: dbPath } of dbPaths) {
       const db = new Database(dbPath, { readonly: true });
       try {
@@ -5133,7 +5402,7 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
         `).all(since);
 
         for (const s of sessions) {
-          const cost = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
+          const { cost, priced } = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
           const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
 
           totalSessions++;
@@ -5144,9 +5413,11 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
           totalToolCalls += s.tool_call_count || 0;
 
           const mKey = s.model || 'unknown';
-          if (!modelMap[mKey]) modelMap[mKey] = { name: mKey, sessions: 0, tokens: 0 };
+          if (!modelMap[mKey]) modelMap[mKey] = { name: mKey, sessions: 0, tokens: 0, cost: 0, unpriced: false };
           modelMap[mKey].sessions++;
           modelMap[mKey].tokens += tokens;
+          modelMap[mKey].cost += cost;
+          if (!priced && tokens > 0) modelMap[mKey].unpriced = true;
 
           const pKey = s.source || 'unknown';
           if (!platformMap[pKey]) platformMap[pKey] = { name: pKey, sessions: 0, tokens: 0 };
@@ -5334,7 +5605,7 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
       let totalMessages = 0, totalToolCalls = 0;
 
       for (const s of rawSessions) {
-        const cost = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
+        const { cost } = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
         const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
 
         // Daily

@@ -544,7 +544,10 @@ function renderEventItem(e) {
     } else if (e.kind === 'spawned' && payload.pid) {
       detailHtml = `→ pid: ${payload.pid}`;
     } else if (e.kind === 'completed' || e.kind === 'done') {
-      detailHtml = `→ finished`;
+      const parts = [];
+      if (payload.summary) parts.push(esc(trunc(String(payload.summary), 80)));
+      if (Array.isArray(payload.artifacts) && payload.artifacts.length) parts.push(`📁 ${payload.artifacts.length} artifact(s)`);
+      detailHtml = `→ ${parts.length ? parts.join(' · ') : 'finished'}`;
     } else if (e.kind === 'heartbeat') {
       detailHtml = ``; // skip heartbeat noise
     } else {
@@ -595,6 +598,27 @@ window.loadWorkspaceFile = async function(filePath, el) {
     el.title = e.message;
   }
 };
+// Load the worker log inline
+window.loadWorkerLog = async function(taskId, el) {
+  if (!taskId) return;
+  const orig = el.innerHTML;
+  el.innerHTML = '⟳ Loading…';
+  el.disabled = true;
+  try {
+    const res = await fetch(`/api/office/kanban/${encodeURIComponent(taskId)}/worker-log?board=${currentBoard}`);
+    const data = await res.json();
+    if (!data?.ok) throw new Error(data?.error || 'Failed');
+    const codeBlock = document.createElement('div');
+    codeBlock.className = 'kb-artifact-content';
+    codeBlock.innerHTML = `<div class="kb-artifact-header">📜 ${esc(data.filename)} (${Math.round(data.size/1024)}KB) <button class="kb-artifact-close" onclick="this.parentElement.parentElement.remove()">✕</button></div><pre><code>${esc(data.content.slice(0, 20000))}${data.content.length > 20000 ? '\n...truncated at 20KB (full log is ' + Math.round(data.size/1024) + 'KB)' : ''}</code></pre>`;
+    el.parentElement.appendChild(codeBlock);
+    el.style.display = 'none';
+  } catch(e) {
+    el.innerHTML = orig;
+    el.disabled = false;
+    el.title = e.message;
+  }
+};
 // Load more items (runs, comments, events)
 window.loadMoreItems = function(type) {
   const hiddenId = type === 'runs' ? 'kb-hidden-runs' : `kb-hidden-${type}`;
@@ -613,6 +637,9 @@ window.loadMoreItems = function(type) {
 };
 window.showKanbanTask = async function(taskId) {
   const existing = document.getElementById('kanban-detail-popup');
+  const oldWidth = existing?.style.width;
+  const oldHeight = existing?.style.height;
+
   if (existing) existing.remove();
   // Show loading popup first
   const popup = document.createElement('div');
@@ -621,9 +648,26 @@ window.showKanbanTask = async function(taskId) {
   popup.dataset.taskId = taskId;
   popup.innerHTML = `<div class="kb-detail-header"><span class="kb-detail-id">Loading...</span></div><div class="swm-loading">⟳ Fetching details...</div>`;
   document.body.appendChild(popup);
+  if (oldWidth) popup.style.width = oldWidth;
+  if (oldHeight) popup.style.height = oldHeight;
   // Close on outside click
+  let isResizing = false;
+  popup.addEventListener('mousedown', (e) => {
+    // Check if clicking near the resize handle (bottom-right)
+    const rect = popup.getBoundingClientRect();
+    if (e.clientX > rect.right - 20 && e.clientY > rect.bottom - 20) {
+      isResizing = true;
+    }
+  });
+  window.addEventListener('mouseup', () => {
+    if (isResizing) {
+      setTimeout(() => { isResizing = false; }, 100);
+    }
+  });
+
   setTimeout(() => {
     document.addEventListener('click', function handler(e) {
+      if (isResizing) return;
       if (!popup.contains(e.target)) {
         popup.remove();
         document.removeEventListener('click', handler);
@@ -702,11 +746,28 @@ window.showKanbanTask = async function(taskId) {
         ${hasMoreEvents ? `<div class="kb-hidden-items" id="kb-hidden-events" style="display:none">${allEvents.slice(10).map(e => renderEventItem(e)).join('')}</div>` : ''}
       </div>
     ` : '';
-    // Attachments
-    const attachHtml = (data.attachments || []).length ? `
+    // Attachments — always render; recorded artifacts may no longer be on disk
+    const allAttach = data.attachments || [];
+    const renderAttach = (a) => {
+      const sizeLbl = (a.size != null && a.size >= 0) ? ` (${Math.round(a.size/1024)}KB)` : '';
+      if (a.source === 'recorded' && !a.exists) {
+        return `<div class="kb-attach kb-attach--missing" title="${esc(a.path || a.filename)}">📄 ${esc(a.filename)}<span class="kb-attach-note">recorded · file no longer on disk</span></div>`;
+      }
+      const ref = a.path || a.filename;
+      return `<div class="kb-attach kb-attach--file" onclick="loadWorkspaceFile('${esc(String(ref))}', this)" title="${esc(String(ref))}">📄 ${esc(a.filename)}${sizeLbl}</div>`;
+    };
+    const attachHtml = `
       <div class="kb-detail-section">
-        <div class="kb-detail-label">📎 Attachments (${data.attachments.length})</div>
-        ${data.attachments.map(a => `<div class="kb-attach">📄 ${esc(a.filename)} (${Math.round(a.size/1024)}KB)</div>`).join('')}
+        <div class="kb-detail-label">📎 Attachments (${allAttach.length})</div>
+        ${allAttach.length ? allAttach.map(renderAttach).join('') : '<div class="kb-attach kb-attach--empty">— no attachments —</div>'}
+      </div>
+    `;
+    // Worker log — content survives even when scratch artifact files were deleted
+    const workerLog = data.workerLog || {};
+    const workerLogHtml = workerLog.exists ? `
+      <div class="kb-detail-section" id="kb-section-worklog">
+        <div class="kb-detail-label">📜 Worker Log (${Math.round((workerLog.size||0)/1024)}KB)</div>
+        <button class="kb-showall-btn" onclick="loadWorkerLog('${esc(task.id)}', this)">Load worker log ↓</button>
       </div>
     ` : '';
     // Dependencies
@@ -715,8 +776,8 @@ window.showKanbanTask = async function(taskId) {
     const depsHtml = (parentIds.length || childIds.length) ? `
       <div class="kb-detail-section">
         <div class="kb-detail-label">🔗 Dependencies</div>
-        ${parentIds.length ? `<div class="kb-deps"><span class="kb-deps-label">↑ Parents:</span> ${parentIds.map(id => `<span class="kb-dep-chip">#${esc(String(id).slice(-8))}</span>`).join(' ')}</div>` : ''}
-        ${childIds.length ? `<div class="kb-deps"><span class="kb-deps-label">↓ Children:</span> ${childIds.map(id => `<span class="kb-dep-chip">#${esc(String(id).slice(-8))}</span>`).join(' ')}</div>` : ''}
+        ${parentIds.length ? `<div class="kb-deps"><span class="kb-deps-label">↑ Parents:</span> ${parentIds.map(id => `<span class="kb-dep-chip" style="cursor:pointer;text-decoration:underline;" onclick="showKanbanTask('${esc(id)}')">#${esc(String(id).slice(-8))}</span>`).join(' ')}</div>` : ''}
+        ${childIds.length ? `<div class="kb-deps"><span class="kb-deps-label">↓ Children:</span> ${childIds.map(id => `<span class="kb-dep-chip" style="cursor:pointer;text-decoration:underline;" onclick="showKanbanTask('${esc(id)}')">#${esc(String(id).slice(-8))}</span>`).join(' ')}</div>` : ''}
       </div>
     ` : '';
     // ── Build Full Timeline (merged runs + comments + events) ────────────
@@ -766,6 +827,7 @@ window.showKanbanTask = async function(taskId) {
       ${commentsHtml}
       ${eventsHtml}
       ${attachHtml}
+      ${workerLogHtml}
       ${depsHtml}
     `;
     popup.innerHTML = `
